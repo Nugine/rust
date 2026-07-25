@@ -35,6 +35,7 @@
 ### T2.1 北极星回归测试（run-make）`[M]`
 - **做什么**：把 01.5 的例子做成跨 crate run-make：上游 crate 含私有 `Foo` + `pub struct FooBox` + `pub fn make_foo` + `#[inline] pub fn f`；下游 crate 调用 `f(make_foo())`；fat LTO 链接并**运行**，断言行为正确（若被过度删除会崩/错）。
 - **涉及**：`tests/run-make/`（新目录 + `rmake.rs`）。
+- **进度**：已落地初版 `tests/run-make/virtual-function-elimination-cross-crate/`（私有 `Foo` + `pub struct FooBox` + `pub fn make_foo` + `#[inline] pub fn f`，下游 crate fat LTO 链接并运行，断言返回 `42`）。当前作为**回归守护**：正确实现下应绿；若 VFE 过度删除 `Foo::foo` 则崩溃/结果错。本地无法构建 rustc（CI LLVM 主机被 DNS 屏蔽），需由 CI 实跑确认当前是否已复现 miscompile。
 - **验收**：在**当前实现**下能复现问题（或至少锁定危险的 vcall_visibility 数值）；修复后转绿。
 - **依赖**：T1.4（了解 WPD 是否真触发，决定测试断言强度）。
 
