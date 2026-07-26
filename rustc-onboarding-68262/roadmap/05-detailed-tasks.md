@@ -35,7 +35,7 @@
 ### T2.1 北极星回归测试（run-make）`[M]`
 - **做什么**：把 01.5 的例子做成跨 crate run-make：上游 crate 含私有 `Foo` + `pub struct FooBox` + `pub fn make_foo` + `#[inline] pub fn f`；下游 crate 调用 `f(make_foo())`；fat LTO 链接并**运行**，断言行为正确（若被过度删除会崩/错）。
 - **涉及**：`tests/run-make/`（新目录 + `rmake.rs`）。
-- **进度**：已落地初版 `tests/run-make/virtual-function-elimination-cross-crate/`（私有 `Foo` + `pub struct FooBox` + `pub fn make_foo` + `#[inline] pub fn f`，下游 crate fat LTO 链接并运行，断言返回 `42`）。当前作为**回归守护**：正确实现下应绿；若 VFE 过度删除 `Foo::foo` 则崩溃/结果错。本地无法构建 rustc（CI LLVM 主机被 DNS 屏蔽），需由 CI 实跑确认当前是否已复现 miscompile。
+- **进度**：已落地初版 `tests/run-make/virtual-function-elimination-cross-crate/`（私有 `Foo` + `pub struct FooBox` + `pub fn make_foo` + `#[inline] pub fn f`，下游 crate fat LTO 链接并运行，断言返回 `42`）。**已本地实测确认复现 miscompile**：用本会话构建的 stage1 rustc 运行，`./main` 触发 `SIGILL`（exit 132），即 VFE 过度删除了仍被调用的 `Foo::foo`。该测试作为**回归守护**：修复后应绿。
 - **验收**：在**当前实现**下能复现问题（或至少锁定危险的 vcall_visibility 数值）；修复后转绿。
 - **依赖**：T1.4（了解 WPD 是否真触发，决定测试断言强度）。
 
@@ -50,6 +50,13 @@
 - **涉及**：`compiler/rustc_codegen_llvm/src/debuginfo/metadata.rs`。
 - **验收**：T2.1/T2.2 全绿；无 miscompile；未过度牺牲明显安全的场景（如纯本地私有 trait 单 CGU 若确实安全可保留）。
 - **依赖**：T2.1、T2.2（先有测试再改）。
+- **⚠️ 处方修正（本次会话实测，详见 `issue-68262-investigation.md` 第 13 节）**：逃逸场景**不能**只回退到
+  `LinkageUnit(1)`——实测 `LinkageUnit(1)` 与 `TranslationUnit(2)` 都会启用 LLVM VFE，北极星测试仍 `SIGILL`；
+  只有 `Public(0)` 能禁用 VFE 从而消除 miscompile。且该问题对 `pub` trait 同样存在，不限私有 trait。
+  故「逃逸判据命中」时应降级到 **`Public(0)`**。逃逸判据建议：存在 `cross_crate_inlinable`（`#[inline]`/泛型）
+  的可达函数，其 MIR 引用了该 `dyn Trait`（现有单 crate codegen 测试的 `taking_*` 均非 inline/泛型，不会被误判，
+  故其 `!{i64 2}`/`!{i64 1}` 期望可保持不变）。彻底正解见 T4.2（修 pre-LTO pipeline 过早降级
+  `type.checked.load`）。
 
 ### T2.4 更新现有 codegen 测试期望 `[S]`
 - **做什么**：保守化后，`tests/codegen-llvm/virtual-function-elimination.rs` 里私有 `T`→`!{i64 2}` 等断言可能需改。用 `--emit=llvm-ir` 观察新值后更新，并加注释说明为何变化。

@@ -277,3 +277,44 @@ ThinLTO 支持不建议作为第一阶段目标。LLVM WPD ThinLTO 和 VFE ThinL
 #68262 的“入手点”不是从零实现 LLVM intrinsic；这些基础设施已经在 rustc 中存在。真正要解决的是：在 Rust 语言的可见性、trait impl、泛型、inline、跨 crate 和动态链接模型下，保守且正确地判断某个 vtable 的使用边界。
 
 建议第一份正式补丁不要试图直接“开启更多 WPD”，而是先提交测试和更保守的可见性逻辑，修掉文档中已经承认的潜在过度删除问题。之后再逐步引入 reachability 分析，让更多安全场景从 `Public` 提升到 `LinkageUnit` / `TranslationUnit`，最终用实际 devirtualization codegen test 证明 #68262 被解决。
+
+## 13. 实测发现（本次会话，已用本地构建的 stage1 rustc 验证）
+
+在放通 `ci-artifacts.rust-lang.org` 后，本会话成功本地构建了 stage1 rustc（LLVM 22 CI 制品）并对北极星回归测试
+`tests/run-make/virtual-function-elimination-cross-crate` 做了实测复现与修复实验，得到一个**修正了此前认知**的关键结论：
+
+**结论：`VCallVisibility` 的取值（`TranslationUnit=2` 还是 `LinkageUnit=1`）并不是本 miscompile 的决定性因素。**
+
+- 现状 `TranslationUnit(2)`（私有 trait + 单 CGU）：`./main` 触发 `SIGILL`（非法指令，exit 132）——复现 miscompile。
+- 将该分支改为 `LinkageUnit(1)` 后重建 rustc：**仍然 `SIGILL`**。已用 `--emit=llvm-ir` 确认 vtable 上的
+  `!vcall_visibility` 确实从 `!{i64 2}` 变成了 `!{i64 1}`，即改动生效，但运行时崩溃依旧。
+- 把 trait 改成 `pub`（从而走 `LinkageUnit(1)` 分支）后：**同样 `SIGILL`**。
+
+原因：在 LLVM 端，`TranslationUnit` 与 `LinkageUnit` **都会启用** VFE（Whole Program Devirtualization 的函数删除）；
+只有 `Public(0)` 才会**禁用** VFE。因此 roadmap 中 T2.3 “把逃逸的私有 trait 从 `TranslationUnit(2)` 回退到
+`LinkageUnit(1)`” 的处方，**无法满足其自身“无 miscompile”的验收标准**。
+
+**根因（进一步定位）：** 真正丢失的是跨 crate `#[inline]` 虚调用的 `llvm.type.checked.load` 信息。
+- 在下游 crate（`main`）里，`#[inline] pub fn f` 的虚调用被内联；实测在 `-Copt-level=0 -Zmir-opt-level=0` 下
+  `f` 的独立代码生成**确实**发出了匹配的 `@llvm.type.checked.load(..., i32 24, metadata !"...3foo3Foo")`
+  （typeid 与 vtable 的 `!type` 一致）；但在 `-Copt-level=3` 下最终内联体里退化成了**普通 `load`**（见
+  `main_ir.ll` 中 `getelementptr ... i64 24` 后紧跟 `load ptr`）。
+- 于是进入 fat-LTO 的合并模块里，vtable 带着 VFE 元数据、却没有任何 `type.checked.load` 引用其 `foo` 槽位，
+  WPD 据此判定该槽位“无人使用”并删除 `Foo::foo`，普通 `load` 读到被删/陷阱指针 → `SIGILL`。
+
+**对后续修复的影响（修订 roadmap T2.3 的处方）：**
+1. 要真正满足“无 miscompile”，逃逸的 vtable 必须降级到 `Public(0)`（禁用 VFE），而**不是** `LinkageUnit(1)`。
+   且该问题**对 `pub` trait 同样存在**，不限于私有 trait。
+2. “逃逸”判据应做到 per-trait 且保守：候选信号是“存在 `cross_crate_inlinable`（`#[inline]`/泛型）的可达函数，
+   其 MIR 里出现了该 `dyn Trait`”。现有单 crate codegen 测试里的 `taking_t/taking_u/taking_v` 都不是
+   inline/泛型（非 `cross_crate_inlinable`），故不会被判为逃逸，可保持 `TranslationUnit(2)`/`LinkageUnit(1)` 不变——
+   这样既修掉北极星 miscompile，又不动现有 codegen 测试的期望。
+3. 更彻底的正解属于 roadmap 阶段四（T4.2）：排查为何 fat-LTO 的 pre-LTO pipeline 会把 `type.checked.load`
+   过早降级为普通 `load`，从而让 WPD 在合并后仍能看到跨 crate 内联虚调用的类型测试。
+
+**可复现的本地构建要点（供后续会话）：**
+- 需先 `git fetch --unshallow origin`（初始为 2-commit 浅克隆），否则 bootstrap 找不到上游 bors 提交。
+- 运行 x.py 时需 `env -u GITHUB_ACTIONS -u CI`，否则 `CiEnv::current()` 误判 `HEAD^1` 为上游提交而对 CI LLVM 404。
+- 当前 HEAD 对应的上游 LLVM 制品提交为 `29e68fe2295f8fc2feb52b8cb0b61a055842fdcf`（HTTP 200）。
+- 增量重建 `x.py build --stage 1 compiler/rustc` 约 35s；跑单个 run-make：
+  `env -u GITHUB_ACTIONS -u CI python3 x.py test tests/run-make/virtual-function-elimination-cross-crate --stage 1`。
